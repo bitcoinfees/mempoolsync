@@ -47,23 +47,23 @@ func (g *GobConn) CheckTip(tip []byte) error {
 }
 
 func (g *GobConn) EncodeAsync(e interface{}) <-chan error {
-	errc := make(chan error)
+	ec := make(chan error)
 	go func() {
 		err := g.enc.Encode(e)
-		errc <- err
-		close(errc)
+		ec <- err
+		close(ec)
 	}()
-	return errc
+	return ec
 }
 
 func (g *GobConn) DecodeAsync(e interface{}) <-chan error {
-	errc := make(chan error)
+	ec := make(chan error)
 	go func() {
 		err := g.dec.Decode(e)
-		errc <- err
-		close(errc)
+		ec <- err
+		close(ec)
 	}()
-	return errc
+	return ec
 }
 
 func (g *GobConn) Close() error {
@@ -153,6 +153,7 @@ func handleConn(g *GobConn, cfg RPCConfig) {
 		log.Println(err)
 		return
 	}
+	log.Println("Tip check OK.")
 
 	mempool, err := getRawMempool(cfg)
 	if err != nil {
@@ -186,6 +187,7 @@ func handleConn(g *GobConn, cfg RPCConfig) {
 		return rTxidMap[txid]
 	}
 	sendList := getSendList(mempool, remoteHas)
+	log.Printf("Sending %d of %d txs.", len(sendList), len(mempool))
 
 	// Send and receive the total number of full txs being sent / received
 	var rLen int
@@ -204,32 +206,65 @@ func handleConn(g *GobConn, cfg RPCConfig) {
 	// Now do the sending / receiving
 	localTxs := make(chan []byte)
 	remoteTxs := make(chan []byte)
-	nc := make(chan int)
+	done := make(chan struct{})
+	defer close(done)
 	e = encodeTxs(localTxs, g)
 	d = decodeTxs(remoteTxs, rLen, g)
-	go getTxs(localTxs, sendList, cfg)
-	go sendTxs(remoteTxs, nc, cfg)
+	getErr := getTxs(localTxs, sendList, cfg, done)
+	sendErr := sendTxs(remoteTxs, cfg)
 
-	if err := <-e; err != nil {
-		log.Println(err)
-		return
+	var numClosed int
+	numAdded := rLen
+	for {
+		select {
+		case err := <-getErr:
+			if err != nil {
+				log.Println("Error getting txs:", err)
+			} else {
+				numClosed++
+				getErr = nil
+			}
+		case err := <-sendErr:
+			if err != nil {
+				log.Println("Error sending txs:", err)
+				numAdded--
+			} else {
+				numClosed++
+				sendErr = nil
+			}
+		case err := <-e:
+			if err != nil {
+				log.Println(err)
+				return
+			} else {
+				numClosed++
+				e = nil
+			}
+		case err := <-d:
+			if err != nil {
+				log.Println(err)
+				return
+			} else {
+				numClosed++
+				d = nil
+			}
+		}
+
+		if numClosed == 4 {
+			break
+		}
 	}
-	if err := <-d; err != nil {
-		log.Println(err)
-		return
-	}
-	n := <-nc
-	log.Printf("Added %d txs to local mempool.", n)
+	log.Printf("Added %d txs to local mempool.", numAdded)
 }
 
 func encodeTxs(txc <-chan []byte, g *GobConn) <-chan error {
 	e := make(chan error)
 	go func() {
+		defer close(e)
 		for tx := range txc {
 			err := <-g.EncodeAsync(tx)
 			if err != nil {
 				e <- err
-				close(e)
 				return
 			}
 		}
@@ -240,44 +275,57 @@ func encodeTxs(txc <-chan []byte, g *GobConn) <-chan error {
 func decodeTxs(txc chan<- []byte, n int, g *GobConn) <-chan error {
 	e := make(chan error)
 	go func() {
+		defer close(e)
+		defer close(txc)
 		for i := 0; i < n; i++ {
 			var tx []byte
 			err := <-g.DecodeAsync(&tx)
 			if err != nil {
 				e <- err
-				close(e)
 				return
 			}
 			txc <- tx
 		}
-		close(txc)
 	}()
 	return e
 }
 
-func getTxs(txc chan<- []byte, txList []string, cfg RPCConfig) {
-	for _, txid := range txList {
-		tx, err := getRawTransaction(txid, cfg)
-		if err != nil {
-			tx = nil
-			log.Println("Error getting raw tx:", err)
+func getTxs(txc chan<- []byte, txList []string, cfg RPCConfig, done <-chan struct{}) <-chan error {
+	e := make(chan error)
+	go func() {
+		defer close(e)
+		defer close(txc)
+		for _, txid := range txList {
+			tx, err := getRawTransaction(txid, cfg)
+			if err != nil {
+				tx = nil
+				select {
+				case e <- err:
+				case <-done:
+					return
+				}
+			}
+			select {
+			case txc <- tx:
+			case <-done:
+				return
+			}
 		}
-		txc <- tx
-	}
-	close(txc)
+	}()
+	return e
 }
 
-func sendTxs(txc <-chan []byte, nc chan<- int, cfg RPCConfig) {
-	var n int
-	for tx := range txc {
-		if err := sendRawTransaction(tx, cfg); err != nil {
-			log.Println("Error sending raw tx:", err)
-		} else {
-			n++
+func sendTxs(txc <-chan []byte, cfg RPCConfig) <-chan error {
+	e := make(chan error)
+	go func() {
+		defer close(e)
+		for tx := range txc {
+			if err := sendRawTransaction(tx, cfg); err != nil {
+				e <-err
+			}
 		}
-	}
-	nc <- n
-	close(nc)
+	}()
+	return e
 }
 
 func setupClient(dialAddr string) (*GobConn, error) {
@@ -466,30 +514,3 @@ func getRespBody(reqbody []byte, cfg RPCConfig) (io.ReadCloser, error) {
 	}
 	return resp.Body, nil
 }
-
-//blockcount, err := getBlockCount(cfg)
-//if err != nil {
-//	log.Fatal(err)
-//}
-//log.Println("Block count is", blockcount)
-//tip, err := getBlockHash(blockcount, cfg)
-//if err != nil {
-//	log.Fatal(err)
-//}
-//log.Println("Tip is", tip)
-
-//mempool, err := getRawMempool(cfg)
-//if err != nil {
-//	log.Fatal(err)
-//}
-//log.Println("len(mempool) is", len(mempool))
-//txidsToSend := getSendList(mempool, func(txid string) bool { return false })
-//log.Println("len(txidsToSend) is", len(txidsToSend))
-//tx, err := getRawTransaction(txidsToSend[0], cfg)
-//if err != nil {
-//	log.Fatal(err)
-//}
-//log.Printf("%s: %d bytes", txidsToSend[0], len(tx))
-//if err := sendRawTransaction(tx, cfg); err != nil {
-//	log.Fatal(err)
-//}
