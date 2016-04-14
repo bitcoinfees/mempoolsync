@@ -187,7 +187,7 @@ func handleConn(g *GobConn, cfg RPCConfig) error {
 	sendList := getSendList(mempool, remoteHas)
 	log.Printf("Sending %d of %d txs.", len(sendList), len(mempool))
 
-	// Send and receive the total number of full txs being sent / received
+	// Send and receive the Number of raw txs to expect
 	var rLen int
 	e = g.EncodeAsync(len(sendList))
 	d = g.DecodeAsync(&rLen)
@@ -200,8 +200,8 @@ func handleConn(g *GobConn, cfg RPCConfig) error {
 	log.Printf("Expecting %d remote txs..", rLen)
 
 	// Now do the sending / receiving
-	localTxs := make(chan []byte)
-	remoteTxs := make(chan []byte)
+	localTxs := make(chan []byte, 10)
+	remoteTxs := make(chan []byte, 10)
 	done := make(chan struct{})
 	defer close(done)
 	e = encodeTxs(localTxs, g)
@@ -248,10 +248,12 @@ func handleConn(g *GobConn, cfg RPCConfig) error {
 			break
 		}
 	}
+	// TODO: Acknowledge completion from other side before returning
 	log.Printf("Added %d txs to local mempool; sync done.", numAdded)
 	return nil
 }
 
+// TODO: progress updates
 func encodeTxs(txc <-chan []byte, g *GobConn) <-chan error {
 	e := make(chan error)
 	go func() {
@@ -267,6 +269,7 @@ func encodeTxs(txc <-chan []byte, g *GobConn) <-chan error {
 	return e
 }
 
+// TODO: progress updates
 func decodeTxs(txc chan<- []byte, n int, g *GobConn) <-chan error {
 	e := make(chan error)
 	go func() {
@@ -316,7 +319,7 @@ func sendTxs(txc <-chan []byte, cfg RPCConfig) <-chan error {
 		defer close(e)
 		for tx := range txc {
 			if err := sendRawTransaction(tx, cfg); err != nil {
-				e <-err
+				e <- err
 			}
 		}
 	}()
