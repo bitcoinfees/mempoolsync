@@ -1,0 +1,495 @@
+package main
+
+import (
+	"bytes"
+	"encoding/gob"
+	"encoding/hex"
+	"errors"
+	"flag"
+	"io"
+	"log"
+	"net"
+	"net/http"
+
+	"github.com/gorilla/rpc/json"
+)
+
+type MempoolEntry struct {
+	Depends []string
+}
+
+// TODO: Make unexported, or make fields exported
+type RPCConfig struct {
+	Addr, User, Password string
+}
+
+type GobConn struct {
+	enc  *gob.Encoder
+	dec  *gob.Decoder
+	conn net.Conn
+}
+
+func (g *GobConn) CheckTip(tip []byte) error {
+	var rTip []byte
+	e := g.EncodeAsync(tip)
+	d := g.DecodeAsync(&rTip)
+	if err := <-e; err != nil {
+		return err
+	}
+	if err := <-d; err != nil {
+		return err
+	}
+
+	if !bytes.Equal(tip, rTip) {
+		return errors.New("Local and remote tip are different, try again later.")
+	}
+	return nil
+}
+
+func (g *GobConn) EncodeAsync(e interface{}) <-chan error {
+	errc := make(chan error)
+	go func() {
+		err := g.enc.Encode(e)
+		errc <- err
+		close(errc)
+	}()
+	return errc
+}
+
+func (g *GobConn) DecodeAsync(e interface{}) <-chan error {
+	errc := make(chan error)
+	go func() {
+		err := g.dec.Decode(e)
+		errc <- err
+		close(errc)
+	}()
+	return errc
+}
+
+func (g *GobConn) Close() error {
+	return g.conn.Close()
+}
+
+type GobListener struct {
+	l net.Listener
+}
+
+func (l *GobListener) Accept() (*GobConn, error) {
+	conn, err := l.l.Accept()
+	if err != nil {
+		return nil, err
+	}
+	g := &GobConn{
+		enc:  gob.NewEncoder(conn),
+		dec:  gob.NewDecoder(conn),
+		conn: conn,
+	}
+	return g, nil
+}
+
+func main() {
+	var (
+		rpcUser, rpcPassword string
+		rpcAddr              string
+		dialAddr             string
+		listenAddr           string
+	)
+	flag.StringVar(&rpcUser, "rpcuser", "", "bitcoind RPC username")
+	flag.StringVar(&rpcPassword, "rpcpassword", "", "bitcoind RPC password")
+	flag.StringVar(&rpcAddr, "rpcaddr", "localhost:8332", "bitcoind RPC address as <host:port>")
+	flag.StringVar(&dialAddr, "c", "", "Client mode; connect to server at <host:port>.")
+	flag.StringVar(&listenAddr, "l", "",
+		"Server mode; listen for client connections on <host:port>.")
+	flag.Parse()
+
+	cfg := RPCConfig{
+		Addr:     rpcAddr,
+		User:     rpcUser,
+		Password: rpcPassword,
+	}
+
+	if listenAddr != "" {
+		// Server mode
+		l, err := setupServer(listenAddr)
+		if err != nil {
+			log.Fatal(err)
+		}
+		log.Println("Listening on", listenAddr)
+		for {
+			g, err := l.Accept()
+			if err != nil {
+				log.Fatal(err)
+			}
+			log.Println("Connected from", g.conn.RemoteAddr())
+			go handleConn(g, cfg)
+		}
+	} else if dialAddr != "" {
+		// Client mode
+		g, err := setupClient(dialAddr)
+		if err != nil {
+			log.Fatal(err)
+		}
+		log.Println("Connected to", dialAddr)
+		handleConn(g, cfg)
+	} else {
+		log.Fatal("Need to specify either -c or -l.")
+	}
+}
+
+func handleConn(g *GobConn, cfg RPCConfig) {
+	defer g.Close()
+
+	height, err := getBlockCount(cfg)
+	if err != nil {
+		log.Println(err)
+		return
+	}
+	tip, err := getBlockHash(height, cfg)
+	if err != nil {
+		log.Println(err)
+		return
+	}
+	if err := g.CheckTip(tip); err != nil {
+		log.Println(err)
+		return
+	}
+
+	mempool, err := getRawMempool(cfg)
+	if err != nil {
+		log.Println(err)
+		return
+	}
+	txids := make([]string, 0, len(mempool))
+	for txid := range mempool {
+		txids = append(txids, txid)
+	}
+	var rTxids []string
+
+	// Send and receive the txids
+	e := g.EncodeAsync(txids)
+	d := g.DecodeAsync(&rTxids)
+	if err := <-e; err != nil {
+		log.Println(err)
+		return
+	}
+	if err := <-d; err != nil {
+		log.Println(err)
+		return
+	}
+
+	// Get the list of txids to send
+	rTxidMap := make(map[string]bool)
+	for _, txid := range rTxids {
+		rTxidMap[txid] = true
+	}
+	remoteHas := func(txid string) bool {
+		return rTxidMap[txid]
+	}
+	sendList := getSendList(mempool, remoteHas)
+
+	// Send and receive the total number of full txs being sent / received
+	var rLen int
+	e = g.EncodeAsync(len(sendList))
+	d = g.DecodeAsync(&rLen)
+	if err := <-e; err != nil {
+		log.Println(err)
+		return
+	}
+	if err := <-d; err != nil {
+		log.Println(err)
+		return
+	}
+	log.Printf("Expecting %d remote txs..")
+
+	// Now do the sending / receiving
+	localTxs := make(chan []byte)
+	remoteTxs := make(chan []byte)
+	nc := make(chan int)
+	e = encodeTxs(localTxs, g)
+	d = decodeTxs(remoteTxs, rLen, g)
+	go getTxs(localTxs, sendList, cfg)
+	go sendTxs(remoteTxs, nc, cfg)
+
+	if err := <-e; err != nil {
+		log.Println(err)
+		return
+	}
+	if err := <-d; err != nil {
+		log.Println(err)
+		return
+	}
+	n := <-nc
+	log.Printf("Added %d txs to local mempool.", n)
+}
+
+func encodeTxs(txc <-chan []byte, g *GobConn) <-chan error {
+	e := make(chan error)
+	go func() {
+		for tx := range txc {
+			err := <-g.EncodeAsync(tx)
+			if err != nil {
+				e <- err
+				close(e)
+				return
+			}
+		}
+	}()
+	return e
+}
+
+func decodeTxs(txc chan<- []byte, n int, g *GobConn) <-chan error {
+	e := make(chan error)
+	go func() {
+		for i := 0; i < n; i++ {
+			var tx []byte
+			err := <-g.DecodeAsync(&tx)
+			if err != nil {
+				e <- err
+				close(e)
+				return
+			}
+			txc <- tx
+		}
+		close(txc)
+	}()
+	return e
+}
+
+func getTxs(txc chan<- []byte, txList []string, cfg RPCConfig) {
+	for _, txid := range txList {
+		tx, err := getRawTransaction(txid, cfg)
+		if err != nil {
+			tx = nil
+			log.Println("Error getting raw tx:", err)
+		}
+		txc <- tx
+	}
+	close(txc)
+}
+
+func sendTxs(txc <-chan []byte, nc chan<- int, cfg RPCConfig) {
+	var n int
+	for tx := range txc {
+		if err := sendRawTransaction(tx, cfg); err != nil {
+			log.Println("Error sending raw tx:", err)
+		} else {
+			n++
+		}
+	}
+	nc <- n
+	close(nc)
+}
+
+func setupClient(dialAddr string) (*GobConn, error) {
+	conn, err := net.Dial("tcp", dialAddr)
+	if err != nil {
+		return nil, err
+	}
+	g := &GobConn{
+		enc:  gob.NewEncoder(conn),
+		dec:  gob.NewDecoder(conn),
+		conn: conn,
+	}
+	return g, nil
+}
+
+func setupServer(listenAddr string) (*GobListener, error) {
+	l, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		return nil, err
+	}
+	return &GobListener{l: l}, nil
+}
+
+// getSendList returns the list of txs to send, specified by txid, in the order
+// in which they should be sent. mempool is the local mempool; remoteHas tests
+// if the remote node has a certain txid. remoteHas can be probabilistic
+// (allowing bloom filters, for e.g.).
+func getSendList(mempool map[string]MempoolEntry, remoteHas func(txid string) bool) []string {
+	childMap := make(map[string][]string)
+	for txid, entry := range mempool {
+		for _, d := range entry.Depends {
+			childMap[d] = append(childMap[d], txid)
+		}
+	}
+
+	toSend := make(map[string]bool)
+	numDepsRemoved := make(map[string]int)
+	var sendList []string
+	var stack []string
+
+	// Initialize the stack with entries without mempool dependencies, and
+	// mark the txs to send.
+	for txid, entry := range mempool {
+		if len(entry.Depends) == 0 {
+			stack = append(stack, txid)
+		}
+		if !remoteHas(txid) {
+			markToSend(txid, toSend, childMap)
+		}
+	}
+
+	for len(stack) > 0 {
+		// Pop
+		newlen := len(stack) - 1
+		txid := stack[newlen]
+		stack = stack[:newlen]
+
+		if toSend[txid] {
+			sendList = append(sendList, txid)
+		}
+
+		for _, child := range childMap[txid] {
+			n := numDepsRemoved[child] + 1
+			if n == len(mempool[child].Depends) {
+				// Child has dependencies satisfied, so add to the stack
+				stack = append(stack, child)
+			}
+			if n > len(mempool[child].Depends) {
+				panic("Num removed deps exceeded num deps.")
+			}
+			numDepsRemoved[child] = n
+		}
+	}
+
+	return sendList
+}
+
+// markToSend marks the tx specified by txid as "to send", along with all its children
+// (i.e. descendant txs).
+func markToSend(txid string, toSend map[string]bool, childMap map[string][]string) {
+	stack := []string{txid}
+	for len(stack) > 0 {
+		// Pop
+		newlen := len(stack) - 1
+		txid := stack[newlen]
+		stack = stack[:newlen]
+
+		if toSend[txid] {
+			// Already marked
+			continue
+		}
+		toSend[txid] = true
+		for _, child := range childMap[txid] {
+			stack = append(stack, child)
+		}
+	}
+}
+
+// getBlockCount makes a getblockcount call to a bitcoin JSON-RPC server.
+func getBlockCount(cfg RPCConfig) (int, error) {
+	// json.EncodeClientRequest doesn't allow empty params? Grrr...
+	r := []byte(`{"id": 0, "method": "getblockcount", "params": []}`)
+	respBody, err := getRespBody(r, cfg)
+	if err != nil {
+		return 0, err
+	}
+	defer respBody.Close()
+
+	var height int
+	err = json.DecodeClientResponse(respBody, &height)
+	return height, err
+}
+
+// getBlockHash makes a getblockhash call to a bitcoin JSON-RPC server.
+func getBlockHash(height int, cfg RPCConfig) ([]byte, error) {
+	r, err := json.EncodeClientRequest("getblockhash", height)
+	respBody, err := getRespBody(r, cfg)
+	if err != nil {
+		return nil, err
+	}
+	defer respBody.Close()
+
+	var hashHex string
+	if err := json.DecodeClientResponse(respBody, &hashHex); err != nil {
+		return nil, err
+	}
+	return hex.DecodeString(hashHex)
+}
+
+// getRawMempool makes a getrawmempool call to a bitcoin JSON-RPC server.
+func getRawMempool(cfg RPCConfig) (map[string]MempoolEntry, error) {
+	r, err := json.EncodeClientRequest("getrawmempool", true)
+	respBody, err := getRespBody(r, cfg)
+	if err != nil {
+		return nil, err
+	}
+	defer respBody.Close()
+
+	mempool := make(map[string]MempoolEntry)
+	err = json.DecodeClientResponse(respBody, &mempool)
+	return mempool, err
+}
+
+// getRawTransaction makes a getrawtransaction call to a bitcoin JSON-RPC server
+func getRawTransaction(txid string, cfg RPCConfig) ([]byte, error) {
+	r, err := json.EncodeClientRequest("getrawtransaction", txid)
+	respBody, err := getRespBody(r, cfg)
+	if err != nil {
+		return nil, err
+	}
+	defer respBody.Close()
+
+	var txHex string
+	if err := json.DecodeClientResponse(respBody, &txHex); err != nil {
+		return nil, err
+	}
+	return hex.DecodeString(txHex)
+}
+
+// getRawTransaction makes a sendrawtransaction call to a bitcoin JSON-RPC server
+func sendRawTransaction(tx []byte, cfg RPCConfig) error {
+	txHex := hex.EncodeToString(tx)
+	r, err := json.EncodeClientRequest("sendrawtransaction", txHex)
+	respBody, err := getRespBody(r, cfg)
+	if err != nil {
+		return err
+	}
+	defer respBody.Close()
+
+	var v interface{}
+	return json.DecodeClientResponse(respBody, &v)
+}
+
+func getRespBody(reqbody []byte, cfg RPCConfig) (io.ReadCloser, error) {
+	url := "http://" + cfg.Addr
+	req, err := http.NewRequest("POST", url, bytes.NewReader(reqbody))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.SetBasicAuth(cfg.User, cfg.Password)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Body, nil
+}
+
+//blockcount, err := getBlockCount(cfg)
+//if err != nil {
+//	log.Fatal(err)
+//}
+//log.Println("Block count is", blockcount)
+//tip, err := getBlockHash(blockcount, cfg)
+//if err != nil {
+//	log.Fatal(err)
+//}
+//log.Println("Tip is", tip)
+
+//mempool, err := getRawMempool(cfg)
+//if err != nil {
+//	log.Fatal(err)
+//}
+//log.Println("len(mempool) is", len(mempool))
+//txidsToSend := getSendList(mempool, func(txid string) bool { return false })
+//log.Println("len(txidsToSend) is", len(txidsToSend))
+//tx, err := getRawTransaction(txidsToSend[0], cfg)
+//if err != nil {
+//	log.Fatal(err)
+//}
+//log.Printf("%s: %d bytes", txidsToSend[0], len(tx))
+//if err := sendRawTransaction(tx, cfg); err != nil {
+//	log.Fatal(err)
+//}
