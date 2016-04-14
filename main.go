@@ -18,7 +18,6 @@ type MempoolEntry struct {
 	Depends []string
 }
 
-// TODO: Make unexported, or make fields exported
 type RPCConfig struct {
 	Addr, User, Password string
 }
@@ -201,7 +200,7 @@ func handleConn(g *GobConn, cfg RPCConfig) {
 		log.Println(err)
 		return
 	}
-	log.Printf("Expecting %d remote txs..")
+	log.Printf("Expecting %d remote txs..", rLen)
 
 	// Now do the sending / receiving
 	localTxs := make(chan []byte)
@@ -254,7 +253,7 @@ func handleConn(g *GobConn, cfg RPCConfig) {
 			break
 		}
 	}
-	log.Printf("Added %d txs to local mempool.", numAdded)
+	log.Printf("Added %d txs to local mempool; sync done.", numAdded)
 }
 
 func encodeTxs(txc <-chan []byte, g *GobConn) <-chan error {
