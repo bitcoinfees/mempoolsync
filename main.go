@@ -120,7 +120,10 @@ func main() {
 				log.Fatal(err)
 			}
 			log.Println("Connected from", g.conn.RemoteAddr())
-			go handleConn(g, cfg)
+			// Only accept one connection at a time.
+			if err := handleConn(g, cfg); err != nil {
+				log.Fatal(err)
+			}
 		}
 	} else if dialAddr != "" {
 		// Client mode
@@ -129,35 +132,33 @@ func main() {
 			log.Fatal(err)
 		}
 		log.Println("Connected to", dialAddr)
-		handleConn(g, cfg)
+		if err := handleConn(g, cfg); err != nil {
+			log.Fatal(err)
+		}
 	} else {
 		log.Fatal("Need to specify either -c or -l.")
 	}
 }
 
-func handleConn(g *GobConn, cfg RPCConfig) {
+func handleConn(g *GobConn, cfg RPCConfig) error {
 	defer g.Close()
 
 	height, err := getBlockCount(cfg)
 	if err != nil {
-		log.Println(err)
-		return
+		return err
 	}
 	tip, err := getBlockHash(height, cfg)
 	if err != nil {
-		log.Println(err)
-		return
+		return err
 	}
 	if err := g.CheckTip(tip); err != nil {
-		log.Println(err)
-		return
+		return err
 	}
 	log.Println("Tip check OK.")
 
 	mempool, err := getRawMempool(cfg)
 	if err != nil {
-		log.Println(err)
-		return
+		return err
 	}
 	txids := make([]string, 0, len(mempool))
 	for txid := range mempool {
@@ -169,12 +170,10 @@ func handleConn(g *GobConn, cfg RPCConfig) {
 	e := g.EncodeAsync(txids)
 	d := g.DecodeAsync(&rTxids)
 	if err := <-e; err != nil {
-		log.Println(err)
-		return
+		return err
 	}
 	if err := <-d; err != nil {
-		log.Println(err)
-		return
+		return err
 	}
 
 	// Get the list of txids to send
@@ -193,12 +192,10 @@ func handleConn(g *GobConn, cfg RPCConfig) {
 	e = g.EncodeAsync(len(sendList))
 	d = g.DecodeAsync(&rLen)
 	if err := <-e; err != nil {
-		log.Println(err)
-		return
+		return err
 	}
 	if err := <-d; err != nil {
-		log.Println(err)
-		return
+		return err
 	}
 	log.Printf("Expecting %d remote txs..", rLen)
 
@@ -233,16 +230,14 @@ func handleConn(g *GobConn, cfg RPCConfig) {
 			}
 		case err := <-e:
 			if err != nil {
-				log.Println(err)
-				return
+				return err
 			} else {
 				numClosed++
 				e = nil
 			}
 		case err := <-d:
 			if err != nil {
-				log.Println(err)
-				return
+				return err
 			} else {
 				numClosed++
 				d = nil
@@ -254,6 +249,7 @@ func handleConn(g *GobConn, cfg RPCConfig) {
 		}
 	}
 	log.Printf("Added %d txs to local mempool; sync done.", numAdded)
+	return nil
 }
 
 func encodeTxs(txc <-chan []byte, g *GobConn) <-chan error {
