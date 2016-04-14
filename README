@@ -1,0 +1,2 @@
+Sync the mempools of two Bitcoin Core nodes. One side needs to run mempoolsync
+with the -l (listen) flag, while the other runs with -c (connect).
