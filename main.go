@@ -133,6 +133,7 @@ func main() {
 
 func handleConn(g *GobConn, cfg RPCConfig) error {
 	defer g.Close()
+	const finished = 0x5A
 
 	height, err := getBlockCount(cfg)
 	if err != nil {
@@ -166,6 +167,7 @@ func handleConn(g *GobConn, cfg RPCConfig) error {
 	if err := <-d; err != nil {
 		return err
 	}
+	log.Println("Txid list exchange complete.")
 
 	// Get the list of txids to send
 	rTxidMap := make(map[string]bool)
@@ -206,14 +208,14 @@ func handleConn(g *GobConn, cfg RPCConfig) error {
 		select {
 		case err := <-getErr:
 			if err != nil {
-				log.Println("Error getting txs:", err)
+				log.Println("getrawtransaction error:", err)
 			} else {
 				numClosed++
 				getErr = nil
 			}
 		case err := <-sendErr:
 			if err != nil {
-				log.Println("Error sending txs:", err)
+				log.Println("sendrawtransaction error:", err)
 				numAdded--
 			} else {
 				numClosed++
@@ -239,7 +241,21 @@ func handleConn(g *GobConn, cfg RPCConfig) error {
 			break
 		}
 	}
-	// TODO: Acknowledge completion from other side before returning
+
+	// Acknowledge that we are finished
+	var rFinished int
+	e = g.EncodeAsync(finished)
+	d = g.DecodeAsync(&rFinished)
+	if err := <-e; err != nil {
+		return err
+	}
+	if err := <-d; err != nil {
+		return err
+	}
+	if rFinished != finished {
+		return errors.New("Failed to acknowledge completion.")
+	}
+
 	log.Printf("Added %d txs to local mempool; sync done.", numAdded)
 	return nil
 }
