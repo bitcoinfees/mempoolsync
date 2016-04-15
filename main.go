@@ -1,6 +1,7 @@
 package main
 
 import (
+	"time"
 	"bytes"
 	"encoding/gob"
 	"errors"
@@ -193,13 +194,11 @@ func handleConn(g *GobConn, cfg RPCConfig) error {
 	log.Printf("Expecting %d remote txs..", rLen)
 
 	// Now do the sending / receiving
-	localTxs := make(chan []byte, 10)
-	remoteTxs := make(chan []byte, 10)
 	done := make(chan struct{})
 	defer close(done)
-	e = encodeTxs(localTxs, g)
-	d = decodeTxs(remoteTxs, rLen, g)
-	getErr := getTxs(localTxs, sendList, cfg, done)
+	localTxs, getErr := getTxs(sendList, cfg, done)
+	lErr := encodeTxs(localTxs, g)
+	remoteTxs, rErr := decodeTxs(rLen, g)
 	sendErr := sendTxs(remoteTxs, cfg)
 
 	var numClosed int
@@ -221,19 +220,19 @@ func handleConn(g *GobConn, cfg RPCConfig) error {
 				numClosed++
 				sendErr = nil
 			}
-		case err := <-e:
+		case err := <-lErr:
 			if err != nil {
 				return err
 			} else {
 				numClosed++
-				e = nil
+				lErr = nil
 			}
-		case err := <-d:
+		case err := <-rErr:
 			if err != nil {
 				return err
 			} else {
 				numClosed++
-				d = nil
+				rErr = nil
 			}
 		}
 
@@ -260,26 +259,36 @@ func handleConn(g *GobConn, cfg RPCConfig) error {
 	return nil
 }
 
-// TODO: progress updates
 func encodeTxs(txc <-chan []byte, g *GobConn) <-chan error {
 	e := make(chan error)
 	go func() {
+		ticker := time.NewTicker(time.Second * 10) // Progress update every 10 seconds
+		defer ticker.Stop()
 		defer close(e)
+		i := 0
 		for tx := range txc {
 			err := <-g.EncodeAsync(tx)
 			if err != nil {
 				e <- err
 				return
 			}
+			i++
+			select {
+			case <-ticker.C:
+				log.Printf("%d local txs sent..", i)
+			default:
+			}
 		}
 	}()
 	return e
 }
 
-// TODO: progress updates
-func decodeTxs(txc chan<- []byte, n int, g *GobConn) <-chan error {
+func decodeTxs(n int, g *GobConn) (<-chan []byte, <-chan error) {
+	txc := make(chan []byte, 10)
 	e := make(chan error)
 	go func() {
+		ticker := time.NewTicker(time.Second * 10) // Progress update every 10 seconds
+		defer ticker.Stop()
 		defer close(e)
 		defer close(txc)
 		for i := 0; i < n; i++ {
@@ -290,12 +299,18 @@ func decodeTxs(txc chan<- []byte, n int, g *GobConn) <-chan error {
 				return
 			}
 			txc <- tx
+			select {
+			case <-ticker.C:
+				log.Printf("%d remote txs received..", i)
+			default:
+			}
 		}
 	}()
-	return e
+	return txc, e
 }
 
-func getTxs(txc chan<- []byte, txList []string, cfg RPCConfig, done <-chan struct{}) <-chan error {
+func getTxs(txList []string, cfg RPCConfig, done <-chan struct{}) (<-chan []byte, <-chan error) {
+	txc := make(chan []byte, 10)
 	e := make(chan error)
 	go func() {
 		defer close(e)
@@ -317,7 +332,7 @@ func getTxs(txc chan<- []byte, txList []string, cfg RPCConfig, done <-chan struc
 			}
 		}
 	}()
-	return e
+	return txc, e
 }
 
 func sendTxs(txc <-chan []byte, cfg RPCConfig) <-chan error {
