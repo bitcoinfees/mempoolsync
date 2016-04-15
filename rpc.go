@@ -11,6 +11,10 @@ import (
 	"net/http"
 )
 
+type MempoolEntry struct {
+	Depends []string
+}
+
 type RPCConfig struct {
 	Addr, User, Password string
 }

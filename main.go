@@ -1,18 +1,14 @@
 package main
 
 import (
-	"time"
 	"bytes"
 	"encoding/gob"
 	"errors"
 	"flag"
 	"log"
 	"net"
+	"time"
 )
-
-type MempoolEntry struct {
-	Depends []string
-}
 
 type GobConn struct {
 	enc  *gob.Encoder
@@ -61,23 +57,6 @@ func (g *GobConn) Close() error {
 	return g.conn.Close()
 }
 
-type GobListener struct {
-	l net.Listener
-}
-
-func (l *GobListener) Accept() (*GobConn, error) {
-	conn, err := l.l.Accept()
-	if err != nil {
-		return nil, err
-	}
-	g := &GobConn{
-		enc:  gob.NewEncoder(conn),
-		dec:  gob.NewDecoder(conn),
-		conn: conn,
-	}
-	return g, nil
-}
-
 func main() {
 	var (
 		rpcUser, rpcPassword string
@@ -101,30 +80,9 @@ func main() {
 
 	if listenAddr != "" {
 		// Server mode
-		l, err := setupServer(listenAddr)
-		if err != nil {
-			log.Fatal(err)
-		}
-		log.Println("Listening on", listenAddr)
-		for {
-			g, err := l.Accept()
-			if err != nil {
-				log.Fatal(err)
-			}
-			log.Println("Connected from", g.conn.RemoteAddr())
-			// Only accept one connection at a time.
-			if err := handleConn(g, cfg); err != nil {
-				log.Fatal(err)
-			}
-		}
+		log.Fatal(runServer(listenAddr, cfg))
 	} else if dialAddr != "" {
-		// Client mode
-		g, err := setupClient(dialAddr)
-		if err != nil {
-			log.Fatal(err)
-		}
-		log.Println("Connected to", dialAddr)
-		if err := handleConn(g, cfg); err != nil {
+		if err := runClient(dialAddr, cfg); err != nil {
 			log.Fatal(err)
 		}
 	} else {
@@ -348,25 +306,43 @@ func sendTxs(txc <-chan []byte, cfg RPCConfig) <-chan error {
 	return e
 }
 
-func setupClient(dialAddr string) (*GobConn, error) {
-	conn, err := net.Dial("tcp", dialAddr)
-	if err != nil {
-		return nil, err
+func runClient(dialAddr string, cfg RPCConfig) error {
+	var g *GobConn
+	if conn, err := net.Dial("tcp", dialAddr); err != nil {
+		return err
+	} else {
+		g = &GobConn{
+			enc:  gob.NewEncoder(conn),
+			dec:  gob.NewDecoder(conn),
+			conn: conn,
+		}
 	}
-	g := &GobConn{
-		enc:  gob.NewEncoder(conn),
-		dec:  gob.NewDecoder(conn),
-		conn: conn,
-	}
-	return g, nil
+
+	log.Println("Connected to", dialAddr)
+	return handleConn(g, cfg)
 }
 
-func setupServer(listenAddr string) (*GobListener, error) {
+func runServer(listenAddr string, cfg RPCConfig) error {
 	l, err := net.Listen("tcp", listenAddr)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return &GobListener{l: l}, nil
+	for {
+		conn, err := l.Accept()
+		if err != nil {
+			log.Println("Accept error:", err)
+			continue
+		}
+		log.Println("Connected from", conn.RemoteAddr())
+		g := &GobConn{
+			enc:  gob.NewEncoder(conn),
+			dec:  gob.NewDecoder(conn),
+			conn: conn,
+		}
+		if err := handleConn(g, cfg); err != nil {
+			log.Println("Error handling conn:", err)
+		}
+	}
 }
 
 // getSendList returns the list of txs to send, specified by txid, in the order

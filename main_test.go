@@ -16,3 +16,10 @@ func TestMain(m *testing.M) {
 
 	os.Exit(m.Run())
 }
+
+func TestApp(t *testing.T) {
+	go runServer("localhost:8000", testConfig)
+	if err := runClient("localhost:8000", testConfig); err != nil {
+		t.Fatal(err)
+	}
+}
