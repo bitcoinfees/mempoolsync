@@ -3,23 +3,14 @@ package main
 import (
 	"bytes"
 	"encoding/gob"
-	"encoding/hex"
 	"errors"
 	"flag"
-	"io"
 	"log"
 	"net"
-	"net/http"
-
-	"github.com/gorilla/rpc/json"
 )
 
 type MempoolEntry struct {
 	Depends []string
-}
-
-type RPCConfig struct {
-	Addr, User, Password string
 }
 
 type GobConn struct {
@@ -420,95 +411,4 @@ func markToSend(txid string, toSend map[string]bool, childMap map[string][]strin
 			stack = append(stack, child)
 		}
 	}
-}
-
-// getBlockCount makes a getblockcount call to a bitcoin JSON-RPC server.
-func getBlockCount(cfg RPCConfig) (int, error) {
-	// json.EncodeClientRequest doesn't allow empty params? Grrr...
-	r := []byte(`{"id": 0, "method": "getblockcount", "params": []}`)
-	respBody, err := getRespBody(r, cfg)
-	if err != nil {
-		return 0, err
-	}
-	defer respBody.Close()
-
-	var height int
-	err = json.DecodeClientResponse(respBody, &height)
-	return height, err
-}
-
-// getBlockHash makes a getblockhash call to a bitcoin JSON-RPC server.
-func getBlockHash(height int, cfg RPCConfig) ([]byte, error) {
-	r, err := json.EncodeClientRequest("getblockhash", height)
-	respBody, err := getRespBody(r, cfg)
-	if err != nil {
-		return nil, err
-	}
-	defer respBody.Close()
-
-	var hashHex string
-	if err := json.DecodeClientResponse(respBody, &hashHex); err != nil {
-		return nil, err
-	}
-	return hex.DecodeString(hashHex)
-}
-
-// getRawMempool makes a getrawmempool call to a bitcoin JSON-RPC server.
-func getRawMempool(cfg RPCConfig) (map[string]MempoolEntry, error) {
-	r, err := json.EncodeClientRequest("getrawmempool", true)
-	respBody, err := getRespBody(r, cfg)
-	if err != nil {
-		return nil, err
-	}
-	defer respBody.Close()
-
-	mempool := make(map[string]MempoolEntry)
-	err = json.DecodeClientResponse(respBody, &mempool)
-	return mempool, err
-}
-
-// getRawTransaction makes a getrawtransaction call to a bitcoin JSON-RPC server
-func getRawTransaction(txid string, cfg RPCConfig) ([]byte, error) {
-	r, err := json.EncodeClientRequest("getrawtransaction", txid)
-	respBody, err := getRespBody(r, cfg)
-	if err != nil {
-		return nil, err
-	}
-	defer respBody.Close()
-
-	var txHex string
-	if err := json.DecodeClientResponse(respBody, &txHex); err != nil {
-		return nil, err
-	}
-	return hex.DecodeString(txHex)
-}
-
-// getRawTransaction makes a sendrawtransaction call to a bitcoin JSON-RPC server
-func sendRawTransaction(tx []byte, cfg RPCConfig) error {
-	txHex := hex.EncodeToString(tx)
-	r, err := json.EncodeClientRequest("sendrawtransaction", txHex)
-	respBody, err := getRespBody(r, cfg)
-	if err != nil {
-		return err
-	}
-	defer respBody.Close()
-
-	var v interface{}
-	return json.DecodeClientResponse(respBody, &v)
-}
-
-func getRespBody(reqbody []byte, cfg RPCConfig) (io.ReadCloser, error) {
-	url := "http://" + cfg.Addr
-	req, err := http.NewRequest("POST", url, bytes.NewReader(reqbody))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.SetBasicAuth(cfg.User, cfg.Password)
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	return resp.Body, nil
 }
