@@ -5,6 +5,7 @@ import (
 	"encoding/gob"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"time"
@@ -96,20 +97,20 @@ func handleConn(g *GobConn, cfg RPCConfig) error {
 
 	height, err := getBlockCount(cfg)
 	if err != nil {
-		return err
+		return fmt.Errorf("getBlockCount: %v", err)
 	}
 	tip, err := getBlockHash(height, cfg)
 	if err != nil {
-		return err
+		return fmt.Errorf("getBlockHash: %v", err)
 	}
 	if err := g.CheckTip(tip); err != nil {
-		return err
+		return fmt.Errorf("CheckTip: %v", err)
 	}
 	log.Println("Tip check OK.")
 
 	mempool, err := getRawMempool(cfg)
 	if err != nil {
-		return err
+		return fmt.Errorf("getRawMempool: %v", err)
 	}
 	txids := make([]string, 0, len(mempool))
 	for txid := range mempool {
@@ -121,10 +122,10 @@ func handleConn(g *GobConn, cfg RPCConfig) error {
 	e := g.EncodeAsync(txids)
 	d := g.DecodeAsync(&rTxids)
 	if err := <-e; err != nil {
-		return err
+		return fmt.Errorf("encoding txids: %v", err)
 	}
 	if err := <-d; err != nil {
-		return err
+		return fmt.Errorf("decoding txids: %v", err)
 	}
 	log.Println("Txid list exchange complete.")
 
@@ -144,10 +145,10 @@ func handleConn(g *GobConn, cfg RPCConfig) error {
 	e = g.EncodeAsync(len(sendList))
 	d = g.DecodeAsync(&rLen)
 	if err := <-e; err != nil {
-		return err
+		return fmt.Errorf("encoding tx num: %v", err)
 	}
 	if err := <-d; err != nil {
-		return err
+		return fmt.Errorf("decoding tx num: %v", err)
 	}
 	log.Printf("Expecting %d remote txs..", rLen)
 
@@ -180,14 +181,14 @@ func handleConn(g *GobConn, cfg RPCConfig) error {
 			}
 		case err := <-lErr:
 			if err != nil {
-				return err
+				return fmt.Errorf("encoding txs: %v", err)
 			} else {
 				numClosed++
 				lErr = nil
 			}
 		case err := <-rErr:
 			if err != nil {
-				return err
+				return fmt.Errorf("decoding txs: %v", err)
 			} else {
 				numClosed++
 				rErr = nil
@@ -204,10 +205,10 @@ func handleConn(g *GobConn, cfg RPCConfig) error {
 	e = g.EncodeAsync(finished)
 	d = g.DecodeAsync(&rFinished)
 	if err := <-e; err != nil {
-		return err
+		return fmt.Errorf("encoding ack: %v", err)
 	}
 	if err := <-d; err != nil {
-		return err
+		return fmt.Errorf("decoding ack: %v", err)
 	}
 	if rFinished != finished {
 		return errors.New("Failed to acknowledge completion.")
